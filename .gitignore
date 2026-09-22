@@ -1,0 +1,4 @@
+# Vault secrets — never commit these
+vault-init.json
+creds
+**local**

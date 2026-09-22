@@ -1,0 +1,189 @@
+# Vault Enterprise Helm values for OpenShift on VMware (vSphere IPI/UPI)
+# Chart: hashicorp/vault 0.34.0
+# Vault version: 2.1.1+ent
+#
+# Key OpenShift differences vs. vanilla Kubernetes:
+#   - global.openshift: true   (adjusts pod security contexts)
+#   - anyuid SCC must be bound to the vault service account before install
+#   - Routes used for ingress (not Ingress resources)
+#
+# Key VMware differences vs. AWS/ROSA:
+#   - storageClass must match the vSphere CSI StorageClass on your cluster.
+#     Run 'oc get storageclass' to find the right name; common defaults are
+#     'thin-csi' (vSphere CSI operator) or 'thin' (in-tree vSphere provider).
+#     Update server.dataStorage.storageClass below before running helm install.
+#   - topology.kubernetes.io/zone labels are typically absent on VMware nodes,
+#     so the topology spread uses kubernetes.io/hostname instead (one pod per
+#     node) which is always present and prevents co-location.
+#   - AWS KMS auto-unseal is not available. Use Vault Transit seal (another
+#     Vault cluster) or a PKCS#11 HSM for production auto-unseal.
+
+global:
+  # Enable OpenShift-specific adjustments (pod security context, service account token)
+  openshift: true
+
+  # TLS is handled at the OpenShift Route (edge termination); disable pod-level TLS
+  tlsDisable: true
+
+  enabled: true
+
+injector:
+  # Enable the Vault Agent Injector (MutatingWebhookConfiguration)
+  enabled: true
+  replicas: 1
+
+  image:
+    repository: "docker.io/hashicorp/vault-k8s"
+    tag: "1.7.5"
+    pullPolicy: IfNotPresent
+
+  agentImage:
+    repository: "docker.io/hashicorp/vault"
+    tag: "2.1.1-ent"
+
+  # Resource limits for the injector
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "256Mi"
+      cpu: "250m"
+
+server:
+  enabled: true
+
+  # Vault Enterprise image — use a fully qualified docker.io reference to avoid
+  # any cluster-level image policy or mirroring rules rewriting the image path.
+  image:
+    repository: "docker.io/hashicorp/vault-enterprise"
+    tag: "2.1.1-ent"
+    pullPolicy: IfNotPresent
+
+  # Enterprise license — references the Kubernetes secret created in Step 3
+  enterpriseLicense:
+    secretName: "vault-ent-license"
+    secretKey: "license"
+
+  # Pod and container security context — set explicitly because global.openshift=true
+  # removes automatic fsGroup/runAsUser. With anyuid SCC bound, we can pin to
+  # Vault's expected UID (100) and use fsGroup=1000 for volume ownership.
+  securityContext:
+    pod:
+      runAsNonRoot: true
+      runAsUser: 100
+      runAsGroup: 1000
+      fsGroup: 1000
+    container:
+      allowPrivilegeEscalation: false
+
+  # Resource limits for Vault server pods
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "256Mi"
+      cpu: "250m"
+
+  # Readiness probe — Vault is ready when unsealed (active, standby, or perf standby).
+  # perfstandbyok=true is required for Vault Enterprise performance standbys (HTTP 473).
+  #   NOTE: the correct param is 'perfstandbyok' (NOT 'performancestandbyok')
+  # sealedcode=204 & uninitcode=204 return HTTP 204 for sealed/uninit pods (not 503),
+  # keeping pods in the endpoint pool so they can receive unseal requests.
+  readinessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204&perfstandbyok=true"
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    failureThreshold: 30
+
+  # Liveness probe — generous initial delay to allow manual Shamir unseal.
+  # perfstandbyok=true is required for Vault Enterprise performance standbys.
+  # For production, use Vault Transit seal or a PKCS#11 HSM to avoid this requirement.
+  livenessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true&perfstandbyok=true"
+    initialDelaySeconds: 300
+    failureThreshold: 10
+
+  # Persistent storage for Raft data.
+  # IMPORTANT: set storageClass to the vSphere CSI class on your cluster.
+  # Run 'oc get storageclass' to confirm — common names:
+  #   thin-csi   (vSphere CSI operator, OCP 4.11+)
+  #   thin       (legacy in-tree vSphere provider)
+  dataStorage:
+    enabled: true
+    size: "10Gi"
+    storageClass: "thin-csi"
+    accessMode: ReadWriteOnce
+
+  # Audit log storage
+  auditStorage:
+    enabled: false
+
+  # HA with Raft integrated storage — 3 replicas
+  ha:
+    enabled: true
+    replicas: 3
+
+    # Raft integrated storage (no external backend needed)
+    raft:
+      enabled: true
+      setNodeId: true
+
+      config: |
+        ui = true
+
+        listener "tcp" {
+          tls_disable = 1
+          address     = "[::]:8200"
+          cluster_address = "[::]:8201"
+          # Prometheus metrics
+          telemetry {
+            unauthenticated_metrics_access = "true"
+          }
+        }
+
+        storage "raft" {
+          path = "/vault/data"
+          # Raft peer discovery — auto-join all vault-N pods in the headless service
+          retry_join {
+            leader_api_addr = "http://vault-0.vault-internal:8200"
+          }
+          retry_join {
+            leader_api_addr = "http://vault-1.vault-internal:8200"
+          }
+          retry_join {
+            leader_api_addr = "http://vault-2.vault-internal:8200"
+          }
+        }
+
+        service_registration "kubernetes" {}
+
+  # Non-HA config block (only used when ha.enabled=false; kept for reference)
+  # standalone:
+  #   enabled: false
+
+  # Topology spread — distribute pods across worker nodes.
+  # On VMware, topology.kubernetes.io/zone is often absent, so we spread by
+  # hostname (one pod per node) which is always present.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: vault
+          component: server
+
+# Vault UI — exposed via an OpenShift Route (created manually in Step 9)
+ui:
+  enabled: true
+  serviceType: "ClusterIP"
+  serviceNodePort: null
+  externalPort: 8200
+
+# CSI Secrets Store provider (optional — enable if using the CSI driver)
+csi:
+  enabled: false
